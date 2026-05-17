@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use quote::{format_ident, quote};
-use syn::{parse_file, visit::Visit, File, Item, ItemMod, ItemUse, UseTree};
+use syn::{parse_file, visit::Visit, File, Item, ItemMacro, ItemMod, ItemUse, UseTree};
 
 ///------------------------------------------------------------
 /// 1. ユーティリティ
@@ -35,13 +35,17 @@ fn collect_leaves(t: &UseTree,
 /// ["adry_library","hash","fenwick"] → <root>/hash/fenwick.rs
 fn lib_file(root: &Path, segs: &[String]) -> PathBuf {
     let mut p = root.to_path_buf();
-    for s in &segs[1..] { 
+    for s in &segs[1..] {
         p.push(s);
     }
     let mut cand = p.clone();
     cand.set_extension("rs");
     if cand.is_file() {
         return cand;
+    }
+    let mod_rs = p.join("mod.rs");
+    if mod_rs.is_file() {
+        return mod_rs;
     }
     p
 }
@@ -54,6 +58,7 @@ fn lib_file(root: &Path, segs: &[String]) -> PathBuf {
 struct Module {
     code: Option<String>,
     children: BTreeMap<String, Module>,
+    extras: Vec<proc_macro2::TokenStream>,
 }
 
 impl Module {
@@ -71,7 +76,14 @@ impl Module {
             Item::Mod(ItemMod { content: None, ident, .. })
                 => !child_names.contains_key(&ident.to_string()),
             _ => true
-        }).cloned().collect()
+        }).cloned().map(|mut item| {
+            if let Item::Macro(im) = &mut item {
+                if im.mac.path.is_ident("macro_rules") {
+                    im.mac.tokens = rewrite_dollar_crate(im.mac.tokens.clone());
+                }
+            }
+            item
+        }).collect()
     }
     fn to_tokens(&self, name: Option<&str>) -> proc_macro2::TokenStream {
         let own_tokens = self.code.as_ref().map(|src| {
@@ -80,10 +92,11 @@ impl Module {
             quote! { #(#filtered)* }
         });
         let kids: Vec<_> = self.children.iter().map(|(n, m)| m.to_tokens(Some(n))).collect();
+        let extras = &self.extras;
         match name {
             Some(n) => { let ident = format_ident!("{n}");
-                quote! { pub mod #ident { #own_tokens #(#kids)* } } }
-            None    => quote! { #own_tokens #(#kids)* },
+                quote! { pub mod #ident { #own_tokens #(#kids)* #(#extras)* } } }
+            None    => quote! { #own_tokens #(#kids)* #(#extras)* },
         }
     }
 }
@@ -119,6 +132,73 @@ fn internal_deps(ast: &File, cur_path: &[String]) -> Vec<Vec<String>> {
     let mut v = Vec::new();
     V { out: &mut v, cur: cur_path }.visit_file(ast);
     v
+}
+
+fn collect_macro_exports(ast: &File, out: &mut BTreeSet<String>) {
+    struct V<'a> { out: &'a mut BTreeSet<String> }
+    impl<'ast, 'a> Visit<'ast> for V<'a> {
+        fn visit_item_macro(&mut self, i: &'ast ItemMacro) {
+            if i.mac.path.is_ident("macro_rules") {
+                let has_export = i.attrs.iter().any(|a| a.path().is_ident("macro_export"));
+                if has_export {
+                    if let Some(ident) = &i.ident {
+                        self.out.insert(ident.to_string());
+                    }
+                }
+            }
+            syn::visit::visit_item_macro(self, i);
+        }
+    }
+    V { out }.visit_file(ast);
+}
+
+/// macro_rules! 本体トークン中の `$crate::` を `$crate::library::` に書き換える。
+/// マクロから library 内の型・関数・他マクロを参照する際、bundle 後の crate ルートでは
+/// library モジュールを介してアクセスする必要があるための補正。
+fn rewrite_dollar_crate(input: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    use proc_macro2::{Delimiter, Group, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
+
+    let mut output = TokenStream::new();
+    let trees: Vec<TokenTree> = input.into_iter().collect();
+    let mut i = 0;
+    while i < trees.len() {
+        match &trees[i] {
+            TokenTree::Group(g) => {
+                let inner = rewrite_dollar_crate(g.stream());
+                let mut new_group = Group::new(g.delimiter(), inner);
+                new_group.set_span(g.span());
+                output.extend(std::iter::once(TokenTree::Group(new_group)));
+                i += 1;
+                let _ = Delimiter::Brace;
+            }
+            TokenTree::Punct(dollar) if dollar.as_char() == '$' => {
+                let crate_ident = trees.get(i + 1);
+                let colon1 = trees.get(i + 2);
+                let colon2 = trees.get(i + 3);
+                let is_dollar_crate_path = matches!(crate_ident, Some(TokenTree::Ident(id)) if id == "crate")
+                    && matches!(colon1, Some(TokenTree::Punct(p)) if p.as_char() == ':')
+                    && matches!(colon2, Some(TokenTree::Punct(p)) if p.as_char() == ':');
+                if is_dollar_crate_path {
+                    output.extend(std::iter::once(trees[i].clone()));     // $
+                    output.extend(std::iter::once(trees[i + 1].clone())); // crate
+                    output.extend(std::iter::once(trees[i + 2].clone())); // :
+                    output.extend(std::iter::once(trees[i + 3].clone())); // :
+                    output.extend(std::iter::once(TokenTree::Ident(Ident::new("library", Span::call_site()))));
+                    output.extend(std::iter::once(TokenTree::Punct(Punct::new(':', Spacing::Joint))));
+                    output.extend(std::iter::once(TokenTree::Punct(Punct::new(':', Spacing::Alone))));
+                    i += 4;
+                } else {
+                    output.extend(std::iter::once(trees[i].clone()));
+                    i += 1;
+                }
+            }
+            _ => {
+                output.extend(std::iter::once(trees[i].clone()));
+                i += 1;
+            }
+        }
+    }
+    output
 }
 
 ///------------------------------------------------------------
@@ -164,6 +244,7 @@ fn main() -> Result<()> {
     // -------------- 再帰的にライブラリを束ねる ------------------
     let mut root_mod  = Module::default();
     let mut visited   = BTreeSet::<Vec<String>>::new();
+    let mut macro_exports: BTreeSet<String> = BTreeSet::new();
     let mut queue: Vec<Vec<String>> = c
         .out
         .into_iter()
@@ -177,11 +258,12 @@ fn main() -> Result<()> {
 
         let fp = lib_file(&lib_root, &path);
         if let Ok(code) = fs::read_to_string(&fp)
-            .with_context(|| format!("read {:?}", fp)) 
+            .with_context(|| format!("read {:?}", fp))
         {
             root_mod.insert(&path, code.clone());
 
             let ast: File = parse_file(&code)?;
+            collect_macro_exports(&ast, &mut macro_exports);
             for dep in internal_deps(&ast, &path) {
                 let mut dep = dep.clone();
                 dep.pop();
@@ -189,6 +271,17 @@ fn main() -> Result<()> {
             }
         } else {
             continue;
+        }
+    }
+
+    // -- #[macro_export] マクロを library モジュール配下に pub use super::* で生やす --
+    if !macro_exports.is_empty() {
+        let library_mod = root_mod.children.entry("library".into()).or_default();
+        for name in &macro_exports {
+            let ident = format_ident!("{}", name);
+            library_mod.extras.push(quote! {
+                pub use super::#ident;
+            });
         }
     }
 
@@ -201,8 +294,41 @@ fn main() -> Result<()> {
 
     // lib_prettyのuse crate::hogeをcrate::library::hogeに変換
     let lib_pretty = lib_pretty.replace("use crate::", "use crate::library::");
-        
+
+    // -- target.rs から library:: 由来の #[macro_export] マクロを単体 import している use 文を除去 --
+    let processed_target = strip_macro_use_lines(&target_src, &macro_exports);
+
     // ------------------------ 出力 ---------------------------
-    println!("{target_src}\n\n// ===== bundled library =====\n\n{lib_pretty}");
+    println!("{processed_target}\n\n// ===== bundled library =====\n\n{lib_pretty}");
     Ok(())
+}
+
+/// `use library::...::NAME;` のうち、NAME が macro_exports に含まれる単純な単体 import 行を除去する。
+/// グループ import (`{...}`) と rename (`as`) は対象外で温存する。
+fn strip_macro_use_lines(src: &str, macro_exports: &BTreeSet<String>) -> String {
+    if macro_exports.is_empty() {
+        return src.to_string();
+    }
+    let mut result = String::with_capacity(src.len());
+    for line in src.split_inclusive('\n') {
+        if !should_strip_use_line(line, macro_exports) {
+            result.push_str(line);
+        }
+    }
+    result
+}
+
+fn should_strip_use_line(line: &str, macro_exports: &BTreeSet<String>) -> bool {
+    let trimmed = line.trim();
+    let Some(after_use) = trimmed.strip_prefix("use library::") else { return false; };
+    let Some(inner) = after_use.strip_suffix(';') else { return false; };
+    let inner = inner.trim();
+    if inner.contains('{') || inner.contains(',') {
+        return false;
+    }
+    if inner.contains(" as ") {
+        return false;
+    }
+    let name = inner.rsplit("::").next().unwrap_or(inner).trim();
+    macro_exports.contains(name)
 }
