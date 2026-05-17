@@ -323,11 +323,25 @@ fn should_strip_use_line(line: &str, macro_exports: &BTreeSet<String>) -> bool {
     let Some(after_use) = trimmed.strip_prefix("use library::") else { return false; };
     let Some(inner) = after_use.strip_suffix(';') else { return false; };
     let inner = inner.trim();
-    if inner.contains('{') || inner.contains(',') {
-        return false;
-    }
     if inner.contains(" as ") {
         return false;
+    }
+    if let Some(group_start) = inner.find('{') {
+        if !inner.ends_with('}') {
+            return false;
+        }
+        let group = &inner[group_start + 1..inner.len() - 1];
+        let names: Vec<&str> = group
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if names.is_empty() {
+            return false;
+        }
+        return names
+            .iter()
+            .all(|n| !n.contains(" as ") && macro_exports.contains(*n));
     }
     let name = inner.rsplit("::").next().unwrap_or(inner).trim();
     macro_exports.contains(name)
